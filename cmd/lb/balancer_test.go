@@ -1,158 +1,110 @@
 package main
 
 import (
-	"hash/fnv"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
-func TestBalancer(t *testing.T) {
-	t.Run("healthy servers selection", func(t *testing.T) {
-		serversPool = []string{
-			"server1:8080",
-			"server2:8080",
-			"server3:8080",
-		}
+func TestChooseHealthy(t *testing.T) {
+	healthMutex.Lock()
+	healthStatus = map[string]bool{
+		"server1:8080": true,
+		"server2:8080": false,
+		"server3:8080": true,
+	}
+	serversPool = []string{"server1:8080", "server2:8080", "server3:8080"}
+	healthMutex.Unlock()
 
-		healthMutex.Lock()
-		healthStatus = map[string]bool{
-			"server1:8080": true,
-			"server2:8080": false,
-			"server3:8080": true,
-		}
-		healthMutex.Unlock()
+	req := &http.Request{
+		RemoteAddr: "192.168.1.10:12345",
+	}
 
-		req := httptest.NewRequest("GET", "/", nil)
-		req.RemoteAddr = "192.168.1.1:12345"
+	server, err := chooseHealthy(req)
+	if err != nil {
+		t.Fatalf("Expected a healthy server, got error: %v", err)
+	}
 
-		rr := httptest.NewRecorder()
-
-		handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			healthMutex.RLock()
-			var healthyServers []string
-			for _, s := range serversPool {
-				if healthy, ok := healthStatus[s]; ok && healthy {
-					healthyServers = append(healthyServers, s)
-				}
-			}
-			healthMutex.RUnlock()
-
-			if len(healthyServers) == 0 {
-				http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
-				return
-			}
-
-			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				clientIP = r.RemoteAddr
-			}
-
-			h := fnv.New32a()
-			h.Write([]byte(clientIP))
-			hashValue := h.Sum32()
-			index := int(hashValue) % len(healthyServers)
-			selectedServer := healthyServers[index]
-
-			rw.Header().Set("lb-server", selectedServer)
-		})
-
-		handler.ServeHTTP(rr, req)
-
-		selectedServer := rr.Header().Get("lb-server")
-		if selectedServer != "server1:8080" && selectedServer != "server3:8080" {
-			t.Errorf("Expected server1:8080 or server3:8080, got %s", selectedServer)
-		}
-	})
-
-	t.Run("no healthy servers available", func(t *testing.T) {
-
-		healthMutex.Lock()
-		healthStatus = map[string]bool{
-			"server1:8080": false,
-			"server2:8080": false,
-			"server3:8080": false,
-		}
-		healthMutex.Unlock()
-
-		req := httptest.NewRequest("GET", "/", nil)
-		rr := httptest.NewRecorder()
-
-		handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			healthMutex.RLock()
-			var healthyServers []string
-			for _, s := range serversPool {
-				if healthy, ok := healthStatus[s]; ok && healthy {
-					healthyServers = append(healthyServers, s)
-				}
-			}
-			healthMutex.RUnlock()
-
-			if len(healthyServers) == 0 {
-				http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
-				return
-			}
-		})
-
-		handler.ServeHTTP(rr, req)
-
-		if rr.Code != http.StatusServiceUnavailable {
-			t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, rr.Code)
-		}
-	})
-
-	t.Run("consistent server selection for same IP", func(t *testing.T) {
-
-		healthMutex.Lock()
-		healthStatus = map[string]bool{
-			"server1:8080": true,
-			"server2:8080": true,
-			"server3:8080": true,
-		}
-		healthMutex.Unlock()
-
-		testIP := "192.168.1.100:54321"
-
-		req1 := httptest.NewRequest("GET", "/", nil)
-		req1.RemoteAddr = testIP
-		rr1 := httptest.NewRecorder()
-
-		handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-			healthMutex.RLock()
-			var healthyServers []string
-			for _, s := range serversPool {
-				if healthy, ok := healthStatus[s]; ok && healthy {
-					healthyServers = append(healthyServers, s)
-				}
-			}
-			healthMutex.RUnlock()
-
-			clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				clientIP = r.RemoteAddr
-			}
-
-			h := fnv.New32a()
-			h.Write([]byte(clientIP))
-			hashValue := h.Sum32()
-			index := int(hashValue) % len(healthyServers)
-			selectedServer := healthyServers[index]
-
-			rw.Header().Set("lb-server", selectedServer)
-		})
-
-		handler.ServeHTTP(rr1, req1)
-		firstServer := rr1.Header().Get("lb-server")
-
-		req2 := httptest.NewRequest("GET", "/", nil)
-		req2.RemoteAddr = testIP
-		rr2 := httptest.NewRecorder()
-		handler.ServeHTTP(rr2, req2)
-		secondServer := rr2.Header().Get("lb-server")
-
-		if firstServer != secondServer {
-			t.Errorf("Expected same server for same IP, got %s and %s", firstServer, secondServer)
-		}
-	})
+	if server != "server1:8080" && server != "server3:8080" {
+		t.Errorf("Unexpected server selected: %s", server)
+	}
 }
+
+func TestChooseHealthyNoHealthyServers(t *testing.T) {
+	healthMutex.Lock()
+	healthStatus = map[string]bool{
+		"server1:8080": false,
+		"server2:8080": false,
+		"server3:8080": false,
+	}
+	healthMutex.Unlock()
+
+	req := &http.Request{
+		RemoteAddr: "192.168.1.10:12345",
+	}
+
+	_, err := chooseHealthy(req)
+	if err == nil {
+		t.Fatal("Expected error due to no healthy servers, got none")
+	}
+}
+
+func TestForwardSuccess(t *testing.T) {
+	// Mock backend server
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Test", "ok")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("response from backend"))
+	}))
+	defer backend.Close()
+
+	// Extract host part (since our forward() expects host only)
+	host := strings.TrimPrefix(backend.URL, "http://")
+
+	// Create dummy request to be forwarded
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+
+	// Create ResponseRecorder to capture output
+	rr := httptest.NewRecorder()
+
+	err := forward(host, rr, req)
+	if err != nil {
+		t.Fatalf("Expected no error from forward, got: %v", err)
+	}
+
+	resp := rr.Result()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
+
+	if string(body) != "response from backend" {
+		t.Errorf("Unexpected response body: %s", string(body))
+	}
+
+	if got := resp.Header.Get("X-Test"); got != "ok" {
+		t.Errorf("Expected X-Test header to be 'ok', got '%s'", got)
+	}
+}
+
+func TestForwardError(t *testing.T) {
+	// Simulate non-responsive backend
+	badServer := "localhost:65534" // Unused port
+
+	req := httptest.NewRequest(http.MethodGet, "http://localhost/", nil)
+	rr := httptest.NewRecorder()
+
+	err := forward(badServer, rr, req)
+	if err == nil {
+		t.Fatal("Expected error from forward to bad server, got nil")
+	}
+
+	resp := rr.Result()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("Expected status 503, got %d", resp.StatusCode)
+	}
+}
+
