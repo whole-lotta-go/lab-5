@@ -4,9 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/roman-mazur/architecture-practice-4-template/httptools"
@@ -28,6 +31,8 @@ var (
 		"server2:8080",
 		"server3:8080",
 	}
+	healthStatus = make(map[string]bool)
+	healthMutex  sync.RWMutex
 )
 
 func scheme() string {
@@ -87,19 +92,48 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 func main() {
 	flag.Parse()
 
-	// TODO: Використовуйте дані про стан сервера, щоб підтримувати список тих серверів, яким можна відправляти запит.
 	for _, server := range serversPool {
 		server := server
 		go func() {
 			for range time.Tick(10 * time.Second) {
-				log.Println(server, "healthy:", health(server))
+				isHealthy := health(server)
+				log.Println(server, "healthy:", isHealthy)
+				healthMutex.Lock()
+				healthStatus[server] = isHealthy
+				healthMutex.Unlock()
 			}
 		}()
 	}
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		// TODO: Реалізуйте свій алгоритм балансувальника.
-		forward(serversPool[0], rw, r)
+		healthMutex.RLock()
+		var healthyServers []string
+		for _, s := range serversPool {
+			if healthy, ok := healthStatus[s]; ok && healthy {
+				healthyServers = append(healthyServers, s)
+			}
+		}
+		healthMutex.RUnlock()
+
+		if len(healthyServers) == 0 {
+			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
+			return
+		}
+
+		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			clientIP = r.RemoteAddr
+		}
+
+		h := fnv.New32a()
+		h.Write([]byte(clientIP))
+		hashValue := h.Sum32()
+		index := int(hashValue) % len(healthyServers)
+		selectedServer := healthyServers[index]
+
+		if err := forward(selectedServer, rw, r); err != nil {
+			log.Printf("Failed to forward request to %s: %v", selectedServer, err)
+		}
 	}))
 
 	log.Println("Starting load balancer...")
