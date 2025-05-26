@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"hash/fnv"
@@ -89,6 +90,33 @@ func forward(dst string, rw http.ResponseWriter, r *http.Request) error {
 	}
 }
 
+func chooseHealthy(r *http.Request) (string, error) {
+	healthMutex.RLock()
+	var healthyServers []string
+	for _, s := range serversPool {
+		if healthy, ok := healthStatus[s]; ok && healthy {
+			healthyServers = append(healthyServers, s)
+		}
+	}
+	healthMutex.RUnlock()
+
+	if len(healthyServers) == 0 {
+		return "", errors.New("no healthy servers available")
+	}
+
+	clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		clientIP = r.RemoteAddr
+	}
+
+	h := fnv.New32a()
+	h.Write([]byte(clientIP))
+	hashValue := h.Sum32()
+	index := int(hashValue) % len(healthyServers)
+	selectedServer := healthyServers[index]
+	return selectedServer, nil
+}
+
 func main() {
 	flag.Parse()
 
@@ -106,31 +134,10 @@ func main() {
 	}
 
 	frontend := httptools.CreateServer(*port, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		healthMutex.RLock()
-		var healthyServers []string
-		for _, s := range serversPool {
-			if healthy, ok := healthStatus[s]; ok && healthy {
-				healthyServers = append(healthyServers, s)
-			}
-		}
-		healthMutex.RUnlock()
-
-		if len(healthyServers) == 0 {
-			http.Error(rw, "No healthy servers available", http.StatusServiceUnavailable)
-			return
-		}
-
-		clientIP, _, err := net.SplitHostPort(r.RemoteAddr)
+		selectedServer, err := chooseHealthy(r)
 		if err != nil {
-			clientIP = r.RemoteAddr
+			http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 		}
-
-		h := fnv.New32a()
-		h.Write([]byte(clientIP))
-		hashValue := h.Sum32()
-		index := int(hashValue) % len(healthyServers)
-		selectedServer := healthyServers[index]
-
 		if err := forward(selectedServer, rw, r); err != nil {
 			log.Printf("Failed to forward request to %s: %v", selectedServer, err)
 		}
