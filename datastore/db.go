@@ -241,10 +241,6 @@ func (db *Db) rotateSegment() error {
 }
 
 func (db *Db) compact() error {
-	if len(db.segmentFiles) <= 1 {
-		return nil
-	}
-
 	tempFile := filepath.Join(db.dir, "compacted-temp")
 	compacted, err := os.Create(tempFile)
 	if err != nil {
