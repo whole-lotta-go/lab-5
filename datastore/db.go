@@ -13,8 +13,9 @@ import (
 )
 
 const (
-	segmentPrefix			= "segment-"
-	defaultMaxSegmentSize	= 10 * 1024 * 1024
+	segmentPrefix         = "segment-"
+	defaultMaxSegmentSize = 10 * 1024 * 1024
+	compactionThreshold   = 3
 )
 
 var ErrNotFound = fmt.Errorf("record does not exist")
@@ -24,20 +25,13 @@ type recordPosition struct {
 	offset       int64
 }
 
-type hashIndex map[string]recordPosition
-
-type segmentInfo struct {
-	filename string
-	number   int
-}
-
 type Db struct {
 	currentSegment *os.File
 	currentOffset  int64
-	index          hashIndex
+	index          map[string]recordPosition
 	dir            string
 	maxSegmentSize int64
-	segments       []segmentInfo
+	segmentFiles   []string
 	nextSegmentNum int
 }
 
@@ -47,23 +41,20 @@ func Open(dir string) (*Db, error) {
 
 func OpenWithSegmentSize(dir string, maxSegmentSize int64) (*Db, error) {
 	db := &Db{
-		index:          make(hashIndex),
+		index:          make(map[string]recordPosition),
 		dir:            dir,
 		maxSegmentSize: maxSegmentSize,
 	}
 
-	err := db.loadSegments()
-	if err != nil {
+	if err := db.loadSegments(); err != nil {
 		return nil, err
 	}
 
-	err = db.recover()
-	if err != nil && err != io.EOF {
+	if err := db.recover(); err != nil && err != io.EOF {
 		return nil, err
 	}
 
-	err = db.createCurrentSegment()
-	if err != nil {
+	if err := db.createCurrentSegment(); err != nil {
 		return nil, err
 	}
 
@@ -76,6 +67,11 @@ func (db *Db) loadSegments() error {
 		return err
 	}
 
+	var segments []struct {
+		filename string
+		number   int
+	}
+
 	maxNum := -1
 	for _, file := range files {
 		base := filepath.Base(file)
@@ -84,10 +80,10 @@ func (db *Db) loadSegments() error {
 		if err != nil {
 			continue
 		}
-		db.segments = append(db.segments, segmentInfo{
-			filename: file,
-			number:   num,
-		})
+		segments = append(segments, struct {
+			filename string
+			number   int
+		}{file, num})
 		if num > maxNum {
 			maxNum = num
 		}
@@ -95,9 +91,14 @@ func (db *Db) loadSegments() error {
 
 	db.nextSegmentNum = maxNum + 1
 
-	sort.Slice(db.segments, func(i, j int) bool {
-		return db.segments[i].number < db.segments[j].number
+	sort.Slice(segments, func(i, j int) bool {
+		return segments[i].number < segments[j].number
 	})
+
+	db.segmentFiles = make([]string, len(segments))
+	for i, seg := range segments {
+		db.segmentFiles[i] = seg.filename
+	}
 
 	return nil
 }
@@ -110,8 +111,6 @@ func (db *Db) createCurrentSegment() error {
 	}
 
 	db.currentSegment = f
-	db.currentOffset = 0
-
 	stat, err := f.Stat()
 	if err != nil {
 		return err
@@ -122,9 +121,8 @@ func (db *Db) createCurrentSegment() error {
 }
 
 func (db *Db) recover() error {
-	for i, segment := range db.segments {
-		err := db.recoverFromFile(segment.filename, i)
-		if err != nil {
+	for i, filename := range db.segmentFiles {
+		if err := db.recoverFromFile(filename, i); err != nil {
 			return err
 		}
 	}
@@ -173,12 +171,8 @@ func (db *Db) Get(key string) (string, error) {
 		return "", ErrNotFound
 	}
 
-	var filename string
-	if position.segmentIndex == len(db.segments) {
-		filename = db.currentSegment.Name()
-	} else if position.segmentIndex < len(db.segments) {
-		filename = db.segments[position.segmentIndex].filename
-	} else {
+	filename := db.getSegmentFilename(position.segmentIndex)
+	if filename == "" {
 		return "", ErrNotFound
 	}
 
@@ -188,8 +182,7 @@ func (db *Db) Get(key string) (string, error) {
 	}
 	defer file.Close()
 
-	_, err = file.Seek(position.offset, 0)
-	if err != nil {
+	if _, err = file.Seek(position.offset, 0); err != nil {
 		return "", err
 	}
 
@@ -200,26 +193,35 @@ func (db *Db) Get(key string) (string, error) {
 	return record.value, nil
 }
 
-func (db *Db) Put(key, value string) error {
-	e := entry{
-		key:   key,
-		value: value,
+func (db *Db) getSegmentFilename(segmentIndex int) string {
+	if segmentIndex == len(db.segmentFiles) {
+		return db.currentSegment.Name()
 	}
+	if segmentIndex < len(db.segmentFiles) {
+		return db.segmentFiles[segmentIndex]
+	}
+	return ""
+}
 
+func (db *Db) Put(key, value string) error {
+	e := entry{key: key, value: value}
 	data := e.Encode()
-	shouldRotate := db.currentOffset+int64(len(data)) > db.maxSegmentSize
 
-	if shouldRotate {
-		err := db.rotateSegment()
-		if err != nil {
+	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
+		if err := db.rotateSegment(); err != nil {
 			return err
+		}
+		if len(db.segmentFiles) >= compactionThreshold {
+			if err := db.compact(); err != nil {
+				return err
+			}
 		}
 	}
 
 	n, err := db.currentSegment.Write(data)
 	if err == nil {
 		db.index[key] = recordPosition{
-			segmentIndex: len(db.segments),
+			segmentIndex: len(db.segmentFiles),
 			offset:       db.currentOffset,
 		}
 		db.currentOffset += int64(n)
@@ -228,54 +230,44 @@ func (db *Db) Put(key, value string) error {
 }
 
 func (db *Db) rotateSegment() error {
-	err := db.currentSegment.Close()
-	if err != nil {
+	if err := db.currentSegment.Close(); err != nil {
 		return err
 	}
 
-	db.segments = append(db.segments, segmentInfo{
-		filename: db.currentSegment.Name(),
-		number:   db.nextSegmentNum,
-	})
-
+	db.segmentFiles = append(db.segmentFiles, db.currentSegment.Name())
 	db.nextSegmentNum++
-	err = db.createCurrentSegment()
-	return err
+
+	return db.createCurrentSegment()
 }
 
-func (db *Db) mergeSegments() error {
-	if len(db.segments) <= 1 {
+func (db *Db) compact() error {
+	if len(db.segmentFiles) <= 1 {
 		return nil
 	}
 
-	tempMergedFile := filepath.Join(db.dir, "merged-temp")
-	mergedFile, err := os.Create(tempMergedFile)
+	tempFile := filepath.Join(db.dir, "compacted-temp")
+	compacted, err := os.Create(tempFile)
 	if err != nil {
 		return err
 	}
 
-	newIndex := make(hashIndex)
+	newIndex := make(map[string]recordPosition)
 	var newOffset int64
 
-	allKeys := make(map[string]bool)
 	for key := range db.index {
-		allKeys[key] = true
-	}
-
-	for key := range allKeys {
 		value, err := db.Get(key)
 		if err != nil {
-			mergedFile.Close()
-			os.Remove(tempMergedFile)
+			compacted.Close()
+			os.Remove(tempFile)
 			return err
 		}
 
 		e := entry{key: key, value: value}
 		data := e.Encode()
-		n, err := mergedFile.Write(data)
+		n, err := compacted.Write(data)
 		if err != nil {
-			mergedFile.Close()
-			os.Remove(tempMergedFile)
+			compacted.Close()
+			os.Remove(tempFile)
 			return err
 		}
 
@@ -286,26 +278,21 @@ func (db *Db) mergeSegments() error {
 		newOffset += int64(n)
 	}
 
-	err = mergedFile.Close()
-	if err != nil {
-		os.Remove(tempMergedFile)
+	if err := compacted.Close(); err != nil {
+		os.Remove(tempFile)
 		return err
 	}
 
-	for _, segment := range db.segments {
-		os.Remove(segment.filename)
+	for _, filename := range db.segmentFiles {
+		os.Remove(filename)
 	}
 
 	newSegmentName := filepath.Join(db.dir, segmentPrefix+"0")
-	err = os.Rename(tempMergedFile, newSegmentName)
-	if err != nil {
+	if err := os.Rename(tempFile, newSegmentName); err != nil {
 		return err
 	}
 
-	db.segments = []segmentInfo{{
-		filename: newSegmentName,
-		number:   0,
-	}}
+	db.segmentFiles = []string{newSegmentName}
 	db.index = newIndex
 	db.nextSegmentNum = 1
 
@@ -314,15 +301,15 @@ func (db *Db) mergeSegments() error {
 
 func (db *Db) Size() (int64, error) {
 	var totalSize int64
-	
-	for _, segment := range db.segments {
-		segmentInfo, err := os.Stat(segment.filename)
+
+	for _, filename := range db.segmentFiles {
+		info, err := os.Stat(filename)
 		if err != nil {
 			return 0, err
 		}
-		totalSize += segmentInfo.Size()
+		totalSize += info.Size()
 	}
-	
+
 	if db.currentSegment != nil {
 		info, err := db.currentSegment.Stat()
 		if err != nil {
@@ -330,6 +317,6 @@ func (db *Db) Size() (int64, error) {
 		}
 		totalSize += info.Size()
 	}
-	
+
 	return totalSize, nil
 }
