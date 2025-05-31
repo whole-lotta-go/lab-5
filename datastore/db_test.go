@@ -209,7 +209,11 @@ func TestCompaction(t *testing.T) {
 	// NOTE: We should probably rewrite the tests for compaction altogether
 	// to use the compact method directly
 	time.Sleep(100 * time.Millisecond)
-	db.waitForCompacted()
+	db.mu.Lock()
+	for db.compacting.Load() {
+		db.compacted.Wait()
+	}
+	db.mu.Unlock()
 
 	finalSegments := len(db.segments)
 	if finalSegments != 1 {
