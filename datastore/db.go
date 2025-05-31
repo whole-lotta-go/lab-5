@@ -10,51 +10,67 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
-	segmentPrefix         = "segment-"
-	defaultMaxSegmentSize = 10 * 1024 * 1024
-	compactionThreshold   = 3
+	segmentPrefix              = "segment-"
+	defaultMaxSegmentSize      = 10 * 1024 * 1024
+	defaultCompactionThreshold = 3
 )
 
 var ErrNotFound = fmt.Errorf("record does not exist")
 
 type recordPosition struct {
-	segmentIndex int
-	offset       int64
+	segment string
+	offset  int64
 }
 
+type Index = map[string]recordPosition
+
 type Db struct {
+	compacting atomic.Bool
+	compacted  *sync.Cond
+	mu         sync.RWMutex
+
+	compactionThreshold int64
+	maxSegmentSize      int64
+
 	currentSegment *os.File
 	currentOffset  int64
-	index          map[string]recordPosition
 	dir            string
-	maxSegmentSize int64
-	segmentFiles   []string
-	nextSegmentNum int
+	segments       []string
+	index          Index
 }
 
 func Open(dir string) (*Db, error) {
-	return OpenWithSegmentSize(dir, defaultMaxSegmentSize)
+	return open(dir, defaultMaxSegmentSize, defaultCompactionThreshold)
 }
 
-func OpenWithSegmentSize(dir string, maxSegmentSize int64) (*Db, error) {
-	db := &Db{
-		index:          make(map[string]recordPosition),
-		dir:            dir,
-		maxSegmentSize: maxSegmentSize,
+func open(dir string, maxSegmentSize int64, compactionThreshold int64) (*Db, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
 	}
+
+	db := &Db{
+		index:               make(map[string]recordPosition),
+		dir:                 dir,
+		maxSegmentSize:      maxSegmentSize,
+		compactionThreshold: compactionThreshold,
+	}
+	db.compacted = sync.NewCond(&db.mu)
 
 	if err := db.loadSegments(); err != nil {
 		return nil, err
 	}
 
-	if err := db.recover(); err != nil && err != io.EOF {
+	if err := db.rebuildIndexLocked(); err != nil && err != io.EOF {
 		return nil, err
 	}
 
-	if err := db.createCurrentSegment(); err != nil {
+	if err := db.createCurrentSegmentLocked(); err != nil {
 		return nil, err
 	}
 
@@ -68,43 +84,39 @@ func (db *Db) loadSegments() error {
 	}
 
 	var segments []struct {
-		filename string
-		number   int
+		segment   string
+		timestamp int64
 	}
 
-	maxNum := -1
 	for _, file := range files {
 		base := filepath.Base(file)
-		numStr := strings.TrimPrefix(base, segmentPrefix)
-		num, err := strconv.Atoi(numStr)
+		timestampStr := strings.TrimPrefix(base, segmentPrefix)
+		timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 		if err != nil {
-			continue
+			continue // Skip files that don't match our timestamp format
 		}
 		segments = append(segments, struct {
-			filename string
-			number   int
-		}{file, num})
-		if num > maxNum {
-			maxNum = num
-		}
+			segment   string
+			timestamp int64
+		}{file, timestamp})
 	}
 
-	db.nextSegmentNum = maxNum + 1
-
+	// Sort by timestamp (oldest first)
 	sort.Slice(segments, func(i, j int) bool {
-		return segments[i].number < segments[j].number
+		return segments[i].timestamp < segments[j].timestamp
 	})
 
-	db.segmentFiles = make([]string, len(segments))
-	for i, seg := range segments {
-		db.segmentFiles[i] = seg.filename
+	db.segments = make([]string, len(segments))
+	for i, segment := range segments {
+		db.segments[i] = segment.segment
 	}
 
 	return nil
 }
 
-func (db *Db) createCurrentSegment() error {
-	segmentPath := filepath.Join(db.dir, segmentPrefix+strconv.Itoa(db.nextSegmentNum))
+func (db *Db) createCurrentSegmentLocked() error {
+	timestamp := time.Now().UnixNano()
+	segmentPath := filepath.Join(db.dir, segmentPrefix+strconv.FormatInt(timestamp, 10))
 	f, err := os.OpenFile(segmentPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
 	if err != nil {
 		return err
@@ -120,23 +132,42 @@ func (db *Db) createCurrentSegment() error {
 	return nil
 }
 
-func (db *Db) recover() error {
-	for i, filename := range db.segmentFiles {
-		if err := db.recoverFromFile(filename, i); err != nil {
+func (db *Db) rebuildIndexLocked() error {
+	db.index = make(Index)
+
+	for _, segment := range db.segments {
+		if err := db.rebuildIndexFromSegmentLocked(segment); err != nil {
+			return err
+		}
+	}
+	if db.currentSegment != nil {
+		if err := db.rebuildIndexFromSegmentLocked(db.currentSegment.Name()); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (db *Db) recoverFromFile(filename string, segmentIndex int) error {
-	f, err := os.Open(filename)
+func (db *Db) rebuildIndexFromSegmentLocked(segment string) error {
+	index, err := getIndexFromSegment(segment)
 	if err != nil {
 		return err
+	}
+	for key, pos := range index {
+		db.index[key] = pos
+	}
+	return nil
+}
+
+func getIndexFromSegment(segment string) (Index, error) {
+	f, err := os.Open(segment)
+	if err != nil {
+		return nil, err
 	}
 	defer f.Close()
 
 	in := bufio.NewReader(f)
+	index := make(map[string]recordPosition)
 	var offset int64
 
 	for {
@@ -144,162 +175,234 @@ func (db *Db) recoverFromFile(filename string, segmentIndex int) error {
 		n, err := record.DecodeFromReader(in)
 		if errors.Is(err, io.EOF) {
 			if n != 0 {
-				return fmt.Errorf("corrupted segment file %s", filename)
+				return nil, fmt.Errorf("corrupted segment file %s", segment)
 			}
 			break
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		db.index[record.key] = recordPosition{
-			segmentIndex: segmentIndex,
-			offset:       offset,
+		index[record.key] = recordPosition{
+			segment: segment,
+			offset:  offset,
 		}
 		offset += int64(n)
 	}
-	return nil
+	return index, nil
 }
 
 func (db *Db) Close() error {
+	db.waitForCompacted()
 	return db.currentSegment.Close()
 }
 
+func (db *Db) waitForCompacted() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	for db.compacting.Load() {
+		db.compacted.Wait()
+	}
+}
+
 func (db *Db) Get(key string) (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	position, ok := db.index[key]
 	if !ok {
 		return "", ErrNotFound
 	}
 
-	filename := db.getSegmentFilename(position.segmentIndex)
-	if filename == "" {
-		return "", ErrNotFound
-	}
-
-	file, err := os.Open(filename)
+	record, err := get(key, position.segment, position.offset)
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
 
-	if _, err = file.Seek(position.offset, 0); err != nil {
-		return "", err
-	}
-
-	var record entry
-	if _, err = record.DecodeFromReader(bufio.NewReader(file)); err != nil {
-		return "", err
-	}
 	return record.value, nil
 }
 
-func (db *Db) getSegmentFilename(segmentIndex int) string {
-	if segmentIndex == len(db.segmentFiles) {
-		return db.currentSegment.Name()
+func get(key string, segmentFile string, offset int64) (*entry, error) {
+	file, err := os.Open(segmentFile)
+	if err != nil {
+		return nil, err
 	}
-	if segmentIndex < len(db.segmentFiles) {
-		return db.segmentFiles[segmentIndex]
+	defer file.Close()
+
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		return nil, err
 	}
-	return ""
+
+	record := &entry{}
+	if _, err := record.DecodeFromReader(bufio.NewReader(file)); err != nil {
+		return nil, err
+	}
+
+	return record, nil
 }
 
 func (db *Db) Put(key, value string) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	e := entry{key: key, value: value}
 	data := e.Encode()
 
 	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
-		if err := db.rotateSegment(); err != nil {
+		if err := db.rotateSegmentLocked(); err != nil {
 			return err
 		}
-		if len(db.segmentFiles) >= compactionThreshold {
-			if err := db.compact(); err != nil {
+		if len(db.segments) >= int(db.compactionThreshold) {
+			go db.compact()
+		}
+	}
+
+	n, err := db.currentSegment.Write(data)
+	if err != nil {
+		return err
+	}
+	err = db.currentSegment.Sync()
+	if err != nil {
+		return err
+	}
+
+	db.index[key] = recordPosition{
+		segment: db.currentSegment.Name(),
+		offset:  db.currentOffset,
+	}
+	db.currentOffset += int64(n)
+
+	return nil
+}
+
+func (db *Db) rotateSegmentLocked() error {
+	if err := db.currentSegment.Close(); err != nil {
+		return err
+	}
+
+	db.segments = append(db.segments, db.currentSegment.Name())
+
+	return db.createCurrentSegmentLocked()
+}
+
+func (db *Db) compact() error {
+	if !db.compacting.CompareAndSwap(false, true) {
+		return nil
+	}
+	defer func() {
+		defer db.compacting.Store(false)
+		defer db.compacted.Broadcast()
+	}()
+
+	ts := time.Now().UnixNano()
+	compPath := filepath.Join(db.dir, segmentPrefix+"tmp")
+	comp, err := os.Create(compPath)
+	finished := false
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if !finished {
+			comp.Close()
+			os.Remove(compPath)
+		}
+	}()
+
+	segsBefore, indexBefore := db.takeSnapshot()
+	ts = time.Now().UnixNano()
+	newPath := filepath.Join(db.dir, segmentPrefix+strconv.FormatInt(ts, 10))
+
+	for _, segPath := range segsBefore {
+		segIndex, err := getIndexFromSegment(segPath)
+		if err != nil {
+			return err
+		}
+
+		for key, pos := range segIndex {
+			posLive, ok := indexBefore[key]
+			if !ok || pos != posLive {
+				continue
+			}
+
+			rec, err := get(key, segPath, pos.offset)
+			if err != nil {
+				return err
+			}
+
+			data := rec.Encode()
+			_, err = comp.Write(data)
+			if err != nil {
 				return err
 			}
 		}
 	}
 
-	n, err := db.currentSegment.Write(data)
-	if err == nil {
-		db.index[key] = recordPosition{
-			segmentIndex: len(db.segmentFiles),
-			offset:       db.currentOffset,
-		}
-		db.currentOffset += int64(n)
-	}
-	return err
-}
-
-func (db *Db) rotateSegment() error {
-	if err := db.currentSegment.Close(); err != nil {
+	if err := comp.Close(); err != nil {
 		return err
 	}
+	if err := os.Rename(compPath, newPath); err != nil {
+		return err
+	}
+	compPath = newPath
 
-	db.segmentFiles = append(db.segmentFiles, db.currentSegment.Name())
-	db.nextSegmentNum++
+	segsAfter, indexAfter := db.takeSnapshot()
 
-	return db.createCurrentSegment()
-}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
-func (db *Db) compact() error {
-	tempFile := filepath.Join(db.dir, "compacted-temp")
-	compacted, err := os.Create(tempFile)
+	newSegs := []string{compPath}
+	newSegs = append(newSegs, db.getNewSegments(segsBefore)...)
+	db.segments = newSegs
+	err = db.rebuildIndexLocked()
 	if err != nil {
-		return err
+		db.segments = segsAfter
+		db.index = indexAfter
+
+		return fmt.Errorf("failed to rebuild index after compaction: %v", err)
 	}
 
-	newIndex := make(map[string]recordPosition)
-	var newOffset int64
-
-	for key := range db.index {
-		value, err := db.Get(key)
-		if err != nil {
-			compacted.Close()
-			os.Remove(tempFile)
-			return err
-		}
-
-		e := entry{key: key, value: value}
-		data := e.Encode()
-		n, err := compacted.Write(data)
-		if err != nil {
-			compacted.Close()
-			os.Remove(tempFile)
-			return err
-		}
-
-		newIndex[key] = recordPosition{
-			segmentIndex: 0,
-			offset:       newOffset,
-		}
-		newOffset += int64(n)
+	for _, segBefore := range segsBefore {
+		os.Remove(segBefore)
 	}
-
-	if err := compacted.Close(); err != nil {
-		os.Remove(tempFile)
-		return err
-	}
-
-	for _, filename := range db.segmentFiles {
-		os.Remove(filename)
-	}
-
-	newSegmentName := filepath.Join(db.dir, segmentPrefix+"0")
-	if err := os.Rename(tempFile, newSegmentName); err != nil {
-		return err
-	}
-
-	db.segmentFiles = []string{newSegmentName}
-	db.index = newIndex
-	db.nextSegmentNum = 1
+	finished = true
 
 	return nil
 }
 
+func (db *Db) getNewSegments(oldSegs []string) []string {
+	mapOld := make(map[string]struct{}, len(oldSegs))
+	for _, oldSeg := range oldSegs {
+		mapOld[oldSeg] = struct{}{}
+	}
+	var newSegs []string
+	for _, newSeg := range db.segments {
+		if _, found := mapOld[newSeg]; !found {
+			newSegs = append(newSegs, newSeg)
+		}
+	}
+	return newSegs
+}
+
+func (db *Db) takeSnapshot() (segsSnap []string, indexSnap Index) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	segsSnap = make([]string, len(db.segments))
+	copy(segsSnap, db.segments)
+	indexSnap = make(map[string]recordPosition)
+	for k, v := range db.index {
+		indexSnap[k] = v
+	}
+	return
+}
+
 func (db *Db) Size() (int64, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+
 	var totalSize int64
 
-	for _, filename := range db.segmentFiles {
-		info, err := os.Stat(filename)
+	for _, segment := range db.segments {
+		info, err := os.Stat(segment)
 		if err != nil {
 			return 0, err
 		}
