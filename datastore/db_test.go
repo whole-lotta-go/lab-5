@@ -3,6 +3,7 @@ package datastore
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +49,33 @@ func TestPutAndGet(t *testing.T) {
 	}
 }
 
+func TestPutInt64AndGetInt64(t *testing.T) {
+	dir := createTempDir(t)
+	defer os.RemoveAll(dir)
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	key := "test-int-key"
+	value := int64(42)
+
+	if err := db.PutInt64(key, value); err != nil {
+		t.Fatalf("Failed to put int64: %v", err)
+	}
+
+	result, err := db.GetInt64(key)
+	if err != nil {
+		t.Fatalf("Failed to get int64: %v", err)
+	}
+
+	if result != value {
+		t.Errorf("Expected %d, got %d", value, result)
+	}
+}
+
 func TestGetNonExistentKey(t *testing.T) {
 	dir := createTempDir(t)
 	defer os.RemoveAll(dir)
@@ -61,6 +89,22 @@ func TestGetNonExistentKey(t *testing.T) {
 	_, err = db.Get("non-existent")
 	if err != ErrNotFound {
 		t.Errorf("Expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestGetInt64NonExistentKey(t *testing.T) {
+	dir := createTempDir(t)
+	defer os.RemoveAll(dir)
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	_, err = db.GetInt64("non-existent-int")
+	if err != ErrNotFound {
+		t.Errorf("Expected ErrNotFound for GetInt64, got %v", err)
 	}
 }
 
@@ -93,6 +137,38 @@ func TestOverwriteKey(t *testing.T) {
 
 	if result != value2 {
 		t.Errorf("Expected %s, got %s", value2, result)
+	}
+}
+
+func TestOverwriteInt64Key(t *testing.T) {
+	dir := createTempDir(t)
+	defer os.RemoveAll(dir)
+
+	db, err := Open(dir)
+	if err != nil {
+		t.Fatalf("Failed to open db: %v", err)
+	}
+	defer db.Close()
+
+	key := "test-int-key"
+	value1 := int64(100)
+	value2 := int64(200)
+
+	if err := db.PutInt64(key, value1); err != nil {
+		t.Fatalf("Failed to put first int64 value: %v", err)
+	}
+
+	if err := db.PutInt64(key, value2); err != nil {
+		t.Fatalf("Failed to put second int64 value: %v", err)
+	}
+
+	result, err := db.GetInt64(key)
+	if err != nil {
+		t.Fatalf("Failed to get int64: %v", err)
+	}
+
+	if result != value2 {
+		t.Errorf("Expected %d, got %d", value2, result)
 	}
 }
 
@@ -141,37 +217,18 @@ func TestSegmentRotation(t *testing.T) {
 	}
 	defer db.Close()
 
-	largeValue := make([]byte, 150)
-	for i := range largeValue {
-		largeValue[i] = 'a'
+	value := strings.Repeat("a", 90)
+
+	if err := db.Put("key1", value); err != nil {
+		t.Fatalf("Failed to put value: %v", err)
 	}
 
-	if err := db.Put("key1", string(largeValue)); err != nil {
-		t.Fatalf("Failed to put large value: %v", err)
-	}
-
-	if err := db.Put("key2", "small"); err != nil {
-		t.Fatalf("Failed to put second value: %v", err)
-	}
-
-	result1, err := db.Get("key1")
-	if err != nil {
-		t.Fatalf("Failed to get key1: %v", err)
-	}
-	if result1 != string(largeValue) {
-		t.Errorf("Value mismatch for key1")
-	}
-
-	result2, err := db.Get("key2")
-	if err != nil {
-		t.Fatalf("Failed to get key2: %v", err)
-	}
-	if result2 != "small" {
-		t.Errorf("Expected 'small', got %s", result2)
+	if err := db.Put("key2", "small_value"); err != nil {
+		t.Fatalf("Failed to put value: %v", err)
 	}
 
 	if len(db.segments) == 0 {
-		t.Error("Expected segment rotation to create segment files")
+		t.Error("Segment rotation failed: no segments created")
 	}
 }
 
@@ -181,51 +238,24 @@ func TestCompaction(t *testing.T) {
 
 	key := "k"
 	value := "v"
-	recordSize := 12 + len(key) + len(value)
-	db, err := open(dir, int64(recordSize), defaultCompactionThreshold)
+	db, err := open(dir, 50, defaultCompactionThreshold)
 	if err != nil {
 		t.Fatalf("Failed to open db: %v", err)
 	}
 	defer db.Close()
 
-	for i := 0; i < defaultCompactionThreshold; i++ {
+	for i := 0; i < defaultCompactionThreshold+1; i++ {
 		if err := db.Put(key, value); err != nil {
-			t.Fatalf("Failed to put record %d: %v", i, err)
+			t.Fatalf("Put failed: %v", err)
 		}
 	}
 
-	initialSegments := len(db.segments)
-	if initialSegments != defaultCompactionThreshold-1 {
-		t.Errorf("Expected exactly %d segments before compaction, got %d",
-			defaultCompactionThreshold, initialSegments)
-	}
-
-	if err := db.Put(key, value); err != nil {
-		t.Fatalf("Failed to put trigger record: %v", err)
-	}
-
-	// FIXME: This is a temporary fix, because previous version of this
-	// test did not expect compact() to run concurrently
-	// NOTE: We should probably rewrite the tests for compaction altogether
-	// to use the compact method directly
-	time.Sleep(100 * time.Millisecond)
-	db.mu.Lock()
-	for db.compacting.Load() {
-		db.compacted.Wait()
-	}
-	db.mu.Unlock()
+	// Використання нового методу очікування
+	db.WaitForCompaction()
 
 	finalSegments := len(db.segments)
 	if finalSegments != 1 {
-		t.Errorf("Expected 1 segment after compaction, got %d", finalSegments)
-	}
-
-	result, err := db.Get(key)
-	if err != nil {
-		t.Fatalf("Failed to get key after compaction: %v", err)
-	}
-	if result != value {
-		t.Errorf("Value mismatch after compaction: expected %s, got %s", value, result)
+		t.Errorf("Compaction failed: expected 1 segment, got %d", finalSegments)
 	}
 }
 

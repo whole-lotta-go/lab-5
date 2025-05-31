@@ -221,7 +221,22 @@ func (db *Db) Get(key string) (string, error) {
 		return "", err
 	}
 
-	return rec.value, nil
+	return rec.stringValue()
+
+}
+
+func (db *Db) GetInt64(key string) (int64, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	pos, ok := db.index[key]
+	if !ok {
+		return 0, ErrNotFound
+	}
+	rec, err := getFromPath(pos.segment.name, pos.offset)
+	if err != nil {
+		return 0, err
+	}
+	return rec.int64Value()
 }
 
 func getFromPath(path string, offset int64) (*entry, error) {
@@ -247,7 +262,7 @@ func (db *Db) Put(key, value string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	rec := entry{key: key, value: value}
+	rec := newStringEntry(key, value)
 	data := rec.Encode()
 
 	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
@@ -279,15 +294,62 @@ func (db *Db) Put(key, value string) error {
 	return nil
 }
 
+func (db *Db) PutInt64(key string, value int64) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	rec := newInt64Entry(key, value)
+	data := rec.Encode()
+	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
+		ts := time.Now().UnixNano()
+		if err := db.rotateSegmentLocked(); err != nil {
+			return err
+		}
+		if len(db.segments) >= int(db.compactionThreshold) {
+			go db.compact(ts)
+		}
+	}
+	n, err := db.currentSegment.Write(data)
+	if err != nil {
+		return err
+	}
+	err = db.currentSegment.Sync()
+	if err != nil {
+		return err
+	}
+	seg := segment{db.currentSegment.Name()}
+	db.index[rec.key] = recordPosition{
+		segment: seg,
+		offset:  db.currentOffset,
+	}
+	db.currentOffset += int64(n)
+	return nil
+}
+
 func (db *Db) rotateSegmentLocked() error {
+	stat, err := db.currentSegment.Stat()
+	if err != nil {
+		return err
+	}
+
+	if stat.Size() > 0 {
+		seg := segment{db.currentSegment.Name()}
+		db.segments = append(db.segments, seg)
+	}
+
 	if err := db.currentSegment.Close(); err != nil {
 		return err
 	}
 
-	seg := segment{db.currentSegment.Name()}
-	db.segments = append(db.segments, seg)
-
 	return db.createCurrentSegmentLocked()
+}
+
+func (db *Db) WaitForCompaction() {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	for db.compacting.Load() {
+		db.compacted.Wait()
+	}
 }
 
 func (db *Db) compact(ts int64) error {
@@ -313,8 +375,8 @@ func (db *Db) compact(ts int64) error {
 	}()
 
 	segsBefore, indexBefore := db.takeSnapshot()
-	ts = time.Now().UnixNano()
-	newPath := filepath.Join(db.dir, segmentPrefix+strconv.FormatInt(ts, 10))
+	compactionTs := time.Now().UnixNano()
+	newPath := filepath.Join(db.dir, segmentPrefix+strconv.FormatInt(compactionTs, 10))
 
 	for _, seg := range segsBefore {
 		segIndex, err := getIndexFromPath(seg.name)
