@@ -1,4 +1,3 @@
-// entry.go
 package datastore
 
 import (
@@ -24,7 +23,6 @@ type entry struct {
 	rawValue []byte
 }
 
-// Helper methods for entry
 
 func (e *entry) stringValue() (string, error) {
 	if e.vtype != stringType {
@@ -43,7 +41,6 @@ func (e *entry) int64Value() (int64, error) {
 	return int64(binary.LittleEndian.Uint64(e.rawValue)), nil
 }
 
-// Factory functions for creating entries
 func newStringEntry(key, value string) entry {
 	return entry{
 		key:      key,
@@ -61,10 +58,6 @@ func newInt64Entry(key string, value int64) entry {
 		rawValue: rawValue,
 	}
 }
-
-// 0           4    8     kl+8  kl+12     kl+13    <-- offset
-// (full size) (kl) (key) (vl)  (vtype)  (value)
-// 4           4    ....  4     1        .....     <-- length
 
 func (e *entry) Encode() []byte {
 	kl := len(e.key)
@@ -135,7 +128,6 @@ func (e *entry) DecodeFromReader(in *bufio.Reader) (int, error) {
 	buf := make([]byte, size)
 	copy(buf[0:4], sizeBuf)
 
-	// Виправлення: спочатку читаємо, потім перевіряємо помилку
 	remaining, err := io.ReadFull(in, buf[4:])
 	n += remaining
 	if err != nil {
