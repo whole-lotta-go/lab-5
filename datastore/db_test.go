@@ -181,7 +181,7 @@ func TestCompaction(t *testing.T) {
 
 	key := "k"
 	value := "v"
-	recordSize := 12 + len(key) + len(value)
+	recordSize := recordHeaderSize + len(key) + len(value)
 	db, err := open(dir, int64(recordSize), defaultCompactionThreshold)
 	if err != nil {
 		t.Fatalf("Failed to open db: %v", err)
@@ -195,9 +195,10 @@ func TestCompaction(t *testing.T) {
 	}
 
 	initialSegments := len(db.segments)
-	if initialSegments != defaultCompactionThreshold-1 {
+	expectedSegments := defaultCompactionThreshold - 1
+	if initialSegments != expectedSegments {
 		t.Errorf("Expected exactly %d segments before compaction, got %d",
-			defaultCompactionThreshold, initialSegments)
+			expectedSegments, initialSegments)
 	}
 
 	if err := db.Put(key, value); err != nil {
@@ -236,7 +237,7 @@ func TestCompactionWithOverwrites(t *testing.T) {
 	key := "k"
 	oldValue := "old"
 	newValue := "new"
-	recordSize := 12 + len(key) + len(oldValue)
+	recordSize := recordHeaderSize + len(key) + len(oldValue)
 	db, err := open(dir, int64(recordSize), defaultCompactionThreshold)
 	if err != nil {
 		t.Fatalf("Failed to open db: %v", err)

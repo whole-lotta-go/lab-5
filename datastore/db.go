@@ -176,7 +176,7 @@ func getIndexFromPath(path string) (index, error) {
 	var offset int64
 
 	for {
-		var rec entry
+		var rec record
 		n, err := rec.DecodeFromReader(in)
 		if errors.Is(err, io.EOF) {
 			if n != 0 {
@@ -208,47 +208,88 @@ func (db *Db) Close() error {
 }
 
 func (db *Db) Get(key string) (string, error) {
+	rec := NewStringRecord(key, "")
+	err := db.get(rec, key)
+	if err != nil {
+		return "", err
+	}
+
+	value, ok := rec.value.(string)
+	if !ok {
+		return "", fmt.Errorf("invalid value type: expected string")
+	}
+
+	return value, nil
+}
+
+func (db *Db) GetInt64(key string) (int64, error) {
+	rec := NewInt64Record(key, 0)
+	err := db.get(rec, key)
+	if err != nil {
+		return 0, err
+	}
+
+	value, ok := rec.value.(int64)
+	if !ok {
+		return 0, fmt.Errorf("invalid value type: expected int64")
+	}
+
+	return value, nil
+}
+
+func (db *Db) get(rec *record, key string) error {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
 	pos, ok := db.index[key]
 	if !ok {
-		return "", ErrNotFound
+		return ErrNotFound
 	}
 
-	rec, err := getFromPath(pos.segment.name, pos.offset)
+	err := getFromPath(rec, pos.segment.name, pos.offset)
 	if err != nil {
-		return "", err
+		return err
 	}
 
-	return rec.value, nil
+	return nil
 }
 
-func getFromPath(path string, offset int64) (*entry, error) {
+func getFromPath(rec *record, path string, offset int64) error {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer file.Close()
 
 	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
+		return err
 	}
 
-	rec := &entry{}
 	if _, err := rec.DecodeFromReader(bufio.NewReader(file)); err != nil {
-		return nil, err
+		return err
 	}
 
-	return rec, nil
+	return nil
 }
 
 func (db *Db) Put(key, value string) error {
+	rec := NewStringRecord(key, value)
+	return db.put(*rec)
+}
+
+func (db *Db) PutInt64(key string, value int64) error {
+	rec := NewInt64Record(key, value)
+	return db.put(*rec)
+}
+
+func (db *Db) put(rec record) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	rec := entry{key: key, value: value}
-	data := rec.Encode()
+	data, err := rec.Encode()
+	if err != nil {
+		return err
+	}
 
 	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
 		ts := time.Now().UnixNano()
@@ -264,13 +305,13 @@ func (db *Db) Put(key, value string) error {
 	if err != nil {
 		return err
 	}
-	err = db.currentSegment.Sync()
-	if err != nil {
+
+	if err = db.currentSegment.Sync(); err != nil {
 		return err
 	}
 
 	seg := segment{db.currentSegment.Name()}
-	db.index[key] = recordPosition{
+	db.index[rec.key] = recordPosition{
 		segment: seg,
 		offset:  db.currentOffset,
 	}
@@ -313,7 +354,6 @@ func (db *Db) compact(ts int64) error {
 	}()
 
 	segsBefore, indexBefore := db.takeSnapshot()
-	ts = time.Now().UnixNano()
 	newPath := filepath.Join(db.dir, segmentPrefix+strconv.FormatInt(ts, 10))
 
 	for _, seg := range segsBefore {
@@ -328,12 +368,17 @@ func (db *Db) compact(ts int64) error {
 				continue
 			}
 
-			rec, err := getFromPath(seg.name, pos.offset)
+			rec := &record{}
+			err := getFromPath(rec, seg.name, pos.offset)
 			if err != nil {
 				return err
 			}
 
-			data := rec.Encode()
+			data, err := rec.Encode()
+			if err != nil {
+				return err
+			}
+
 			_, err = comp.Write(data)
 			if err != nil {
 				return err
