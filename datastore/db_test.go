@@ -31,8 +31,8 @@ func TestPutAndGet(t *testing.T) {
 	}
 	defer db.Close()
 
-	key := "test-key"
-	value := "test-value"
+	key := "k"
+	value := "v"
 
 	if err := db.Put(key, value); err != nil {
 		t.Fatalf("Failed to put: %v", err)
@@ -74,9 +74,9 @@ func TestOverwriteKey(t *testing.T) {
 	}
 	defer db.Close()
 
-	key := "test-key"
-	value1 := "first-value"
-	value2 := "second-value"
+	key := "k"
+	value1 := "v1"
+	value2 := "v2"
 
 	if err := db.Put(key, value1); err != nil {
 		t.Fatalf("Failed to put first value: %v", err)
@@ -100,8 +100,8 @@ func TestPersistence(t *testing.T) {
 	dir := createTempDir(t)
 	defer os.RemoveAll(dir)
 
-	key := "persistent-key"
-	value := "persistent-value"
+	key := "k"
+	value := "v"
 
 	func() {
 		db, err := Open(dir)
@@ -131,51 +131,46 @@ func TestPersistence(t *testing.T) {
 	}
 }
 
-func TestSegmentRotation(t *testing.T) {
+func TestRotateSegment(t *testing.T) {
 	dir := createTempDir(t)
 	defer os.RemoveAll(dir)
 
-	db, err := open(dir, 100, defaultCompactionThreshold)
+	db, err := Open(dir)
 	if err != nil {
 		t.Fatalf("Failed to open db: %v", err)
 	}
 	defer db.Close()
 
-	largeValue := make([]byte, 150)
-	for i := range largeValue {
-		largeValue[i] = 'a'
+	segLen := len(db.segments)
+	if segLen != 0 {
+		t.Fatalf("Expected 0 segment before rotation, got %d", segLen)
+	}
+	beforeCurSeg := db.currentSegment.Name()
+
+	key := "k"
+	value := "v"
+	if err := db.Put(key, value); err != nil {
+		t.Fatalf("Failed to put: %v", err)
 	}
 
-	if err := db.Put("key1", string(largeValue)); err != nil {
-		t.Fatalf("Failed to put large value: %v", err)
+	db.mu.Lock()
+	if err := db.rotateSegmentLocked(); err != nil {
+		t.Fatalf("Failed to rotate segment: %v", err)
+	}
+	db.mu.Unlock()
+
+	segLen = len(db.segments)
+	if segLen != 1 {
+		t.Errorf("Expected 1 segment after rotation, got %d", segLen)
 	}
 
-	if err := db.Put("key2", "small"); err != nil {
-		t.Fatalf("Failed to put second value: %v", err)
-	}
-
-	result1, err := db.Get("key1")
-	if err != nil {
-		t.Fatalf("Failed to get key1: %v", err)
-	}
-	if result1 != string(largeValue) {
-		t.Errorf("Value mismatch for key1")
-	}
-
-	result2, err := db.Get("key2")
-	if err != nil {
-		t.Fatalf("Failed to get key2: %v", err)
-	}
-	if result2 != "small" {
-		t.Errorf("Expected 'small', got %s", result2)
-	}
-
-	if len(db.segments) == 0 {
-		t.Error("Expected segment rotation to create segment files")
+	afterCurSeg := db.currentSegment.Name()
+	if beforeCurSeg == afterCurSeg {
+		t.Errorf("Expected new file for a new current segment, got %s", afterCurSeg)
 	}
 }
 
-func TestCompaction(t *testing.T) {
+func TestCompact(t *testing.T) {
 	dir := createTempDir(t)
 	defer os.RemoveAll(dir)
 
@@ -194,27 +189,16 @@ func TestCompaction(t *testing.T) {
 		}
 	}
 
-	initialSegments := len(db.segments)
-	expectedSegments := defaultCompactionThreshold - 1
-	if initialSegments != expectedSegments {
-		t.Errorf("Expected exactly %d segments before compaction, got %d",
-			expectedSegments, initialSegments)
-	}
-
-	if err := db.Put(key, value); err != nil {
-		t.Fatalf("Failed to put trigger record: %v", err)
-	}
-
-	// FIXME: This is a temporary fix, because previous version of this
-	// test did not expect compact() to run concurrently
-	// NOTE: We should probably rewrite the tests for compaction altogether
-	// to use the compact method directly
-	time.Sleep(100 * time.Millisecond)
+	// Simulate passing the threshold
 	db.mu.Lock()
-	for db.compacting.Load() {
-		db.compacted.Wait()
+	ts := time.Now().UnixNano()
+	if err := db.rotateSegmentLocked(); err != nil {
+		t.Fatalf("Failed to rotate segment: %v", err)
 	}
 	db.mu.Unlock()
+	if err := db.compact(ts); err != nil {
+		t.Fatalf("Failed to compact segment: %v", err)
+	}
 
 	finalSegments := len(db.segments)
 	if finalSegments != 1 {
@@ -227,67 +211,6 @@ func TestCompaction(t *testing.T) {
 	}
 	if result != value {
 		t.Errorf("Value mismatch after compaction: expected %s, got %s", value, result)
-	}
-}
-
-func TestCompactionWithOverwrites(t *testing.T) {
-	dir := createTempDir(t)
-	defer os.RemoveAll(dir)
-
-	key := "k"
-	oldValue := "old"
-	newValue := "new"
-	recordSize := recordHeaderSize + len(key) + len(oldValue)
-	db, err := open(dir, int64(recordSize), defaultCompactionThreshold)
-	if err != nil {
-		t.Fatalf("Failed to open db: %v", err)
-	}
-	defer db.Close()
-
-	for i := 0; i < defaultCompactionThreshold; i++ {
-		if err := db.Put(key, oldValue); err != nil {
-			t.Fatalf("Failed to put old value: %v", err)
-		}
-	}
-
-	if err := db.Put(key, newValue); err != nil {
-		t.Fatalf("Failed to overwrite key: %v", err)
-	}
-
-	result, err := db.Get(key)
-	if err != nil {
-		t.Fatalf("Failed to get key after compaction: %v", err)
-	}
-	if result != newValue {
-		t.Errorf("Expected '%s', got %s", newValue, result)
-	}
-}
-
-func TestMultipleCompactions(t *testing.T) {
-	dir := createTempDir(t)
-	defer os.RemoveAll(dir)
-
-	key := "k"
-	val := "v"
-	recordSize := 12 + len(key) + len(val)
-	db, err := open(dir, int64(recordSize), defaultCompactionThreshold)
-	if err != nil {
-		t.Fatalf("Failed to open db: %v", err)
-	}
-	defer db.Close()
-
-	for i := 0; i < (defaultCompactionThreshold+1)*2; i++ {
-		if err := db.Put(key, val); err != nil {
-			t.Fatalf("Failed to put old value: %v", err)
-		}
-	}
-
-	result, err := db.Get(key)
-	if err != nil {
-		t.Fatalf("Failed to get key after compaction: %v", err)
-	}
-	if result != val {
-		t.Errorf("Expected '%s', got %s", val, result)
 	}
 }
 

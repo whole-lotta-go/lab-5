@@ -292,13 +292,7 @@ func (db *Db) put(rec record) error {
 	}
 
 	if db.currentOffset+int64(len(data)) > db.maxSegmentSize {
-		ts := time.Now().UnixNano()
-		if err := db.rotateSegmentLocked(); err != nil {
-			return err
-		}
-		if len(db.segments) >= int(db.compactionThreshold) {
-			go db.compact(ts)
-		}
+		db.triggerRotateLocked()
 	}
 
 	n, err := db.currentSegment.Write(data)
@@ -317,6 +311,17 @@ func (db *Db) put(rec record) error {
 	}
 	db.currentOffset += int64(n)
 
+	return nil
+}
+
+func (db *Db) triggerRotateLocked() error {
+	ts := time.Now().UnixNano()
+	if err := db.rotateSegmentLocked(); err != nil {
+		return err
+	}
+	if len(db.segments) >= int(db.compactionThreshold) {
+		go db.compact(ts)
+	}
 	return nil
 }
 
